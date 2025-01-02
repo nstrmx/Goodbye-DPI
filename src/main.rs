@@ -16,27 +16,31 @@ use tokio::{
 use url::Url;
 
 
+const BUFFER_SIZE: usize = 4096;
+
+
 type BlackList = AhoCorasick;
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
 trait Pipe: AsyncReadWrite {
-    async fn pipe_stream<T>(&mut self, stream: &mut T) -> Result<()>
+    async fn pipe_stream<T>(&mut self, other: &mut T) -> Result<()>
         where T: AsyncReadWrite;
+    
     async fn pipe<T, U>(reader: ReadHalf<T>, writer: WriteHalf<U>) -> Result<()>
         where T: AsyncRead + Unpin + Send, U: AsyncWrite + Unpin + Send;
 }
 
 impl Pipe for TcpStream {
-    async fn pipe_stream<T>(&mut self, stream: &mut T) -> Result<()> 
+    async fn pipe_stream<T>(&mut self, other: &mut T) -> Result<()> 
         where T: AsyncReadWrite
     {
-        let (local_reader, local_writer) = split(stream);
-        let (remote_reader, remote_writer) = split(self);
+        let (this_reader, this_writer) = split(self);
+        let (other_reader, other_writer) = split(other);
         tokio::try_join!(
-            Self::pipe(local_reader, remote_writer), 
-            Self::pipe(remote_reader, local_writer)
+            Self::pipe(this_reader, other_writer), 
+            Self::pipe(other_reader, this_writer),
         )?;
         Ok(())
     }
@@ -44,12 +48,12 @@ impl Pipe for TcpStream {
     async fn pipe<T, U>(mut reader: ReadHalf<T>, mut writer: WriteHalf<U>) -> Result<()> 
         where T: AsyncRead + Unpin + Send, U: AsyncWrite + Unpin + Send
     {
-       let mut buffer = vec![0; 2048];
+        let mut buffer = vec![0; BUFFER_SIZE];
         loop {
-            let n = reader.read(&mut buffer).await?; 
+            let n = reader.read(&mut buffer).await?;
             if n == 0 {
                 break;
-            }
+            }    
             writer.write_all(&buffer[..n]).await?;
             writer.flush().await?;
         }
@@ -61,7 +65,7 @@ impl Pipe for TcpStream {
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
-    let blacklist = Arc::new(load_blacklist().await?);
+    let blacklist = Arc::new(load_blacklist("full_blacklist").await?);
     let addr: SocketAddr = "127.0.0.1:8881".parse()?;
     let listener = TcpListener::bind(&addr).await?;
     info!("Proxy has started at {addr}");
@@ -84,12 +88,12 @@ async fn main() -> Result<()> {
 }
 
 
-async fn load_blacklist() -> Result<BlackList> {
+async fn load_blacklist(filename: &str) -> Result<BlackList> {
     let mut buffer = String::new();
-    File::open("full_blacklist").await?.read_to_string(&mut buffer).await?;
+    File::open(filename).await?.read_to_string(&mut buffer).await?;
     let blacklist: Vec<String> = buffer.split('\n')
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !s.starts_with("//"))
         .collect();
     let blacklist = AhoCorasickBuilder::new().build(&blacklist)?;
     Ok(blacklist)
@@ -113,9 +117,12 @@ impl Client {
 
     async fn handle(&mut self) -> Result<()> {
         // Read stream
-        let mut buffer = vec![0; 2048];
+        let mut buffer = vec![0; BUFFER_SIZE];
         let n = self.local_stream.read(&mut buffer).await?;
         buffer.truncate(n);
+        if n == 0 {
+            return Ok(());
+        }
         debug!("Client {}: read {n} bytes", self.id);
         debug!("Client {}: buffer\n{}", self.id, String::from_utf8_lossy(&buffer));
         let parts = self.split_buffer(&buffer, b"\r\n\r\n").await;
@@ -133,10 +140,9 @@ impl Client {
             bail!("Unsupported request");
         }
         // Open remote TCP stream
-        if parts[0] == b"CONNECT" {
-            self.handle_https(parts[1]).await?;
-        } else {
-            self.handle_http(parts[1], &buffer).await?;
+        match parts[0] {
+            b"CONNECT" => self.handle_https(parts[1]).await?,
+            _ => self.handle_http(parts[1], &buffer).await?,
         }
         Ok(())
     }
@@ -175,7 +181,7 @@ impl Client {
         self.local_stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
         debug!("Client {}: sent 200 OK", self.id);
         // Process stream
-        if self.blacklist.is_match(&host) && port == 443 {
+        if port == 443 {
             self.fragment_stream(&mut tcp_stream).await?;
         } 
         self.local_stream.pipe_stream(&mut tcp_stream).await?;
@@ -200,7 +206,7 @@ impl Client {
     }
 
     async fn fragment_stream(&mut self, remote_stream: &mut TcpStream) -> Result<()> {
-        let mut buffer = vec![0; 1024];
+        let mut buffer = vec![0; BUFFER_SIZE];
         let n = self.local_stream.read(&mut buffer).await?;
         buffer.truncate(n);
         // debug!("Client {}: fragment buffer\n{}", self.id, String::from_utf8_lossy(&buffer));
