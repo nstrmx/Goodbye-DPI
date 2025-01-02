@@ -1,5 +1,6 @@
 # Goodbye-DPI
 This is a crossplatform Deep Packet Inspection circumvention utility inspired by [Goodbye DPI](https://github.com/ValdikSS/GoodbyeDPI)
+The idea is to fragment first data packet on TCP level using blacklist and Aho-Corasick algorithm.
 
 ## Table of Contents
 
