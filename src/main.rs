@@ -1,8 +1,10 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{fs, net::SocketAddr, sync::Arc};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::{Context, Result, bail};
+use clap::Parser;
 use log::{debug, info, error};
 use rand::{thread_rng, Rng};
+use serde::{Deserialize, Deserializer};
 use tokio::{
     fs::File, 
     io::{
@@ -13,6 +15,7 @@ use tokio::{
     }, 
     net::{TcpStream, TcpListener},
 };
+use tokio_socks::tcp::Socks5Stream;
 use url::Url;
 
 
@@ -21,43 +24,48 @@ const BUFFER_SIZE: usize = 4096;
 
 type BlackList = AhoCorasick;
 
-trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
-trait Pipe: AsyncReadWrite {
-    async fn pipe_stream<T>(&mut self, other: &mut T) -> Result<()>
-        where T: AsyncReadWrite;
-    
-    async fn pipe<T, U>(reader: ReadHalf<T>, writer: WriteHalf<U>) -> Result<()>
-        where T: AsyncRead + Unpin + Send, U: AsyncWrite + Unpin + Send;
+#[derive(Parser)]
+struct Args {
+    /// Path to the configuration file
+    #[clap(short, long)]
+    config: Option<String>,
 }
 
-impl Pipe for TcpStream {
-    async fn pipe_stream<T>(&mut self, other: &mut T) -> Result<()> 
-        where T: AsyncReadWrite
-    {
-        let (this_reader, this_writer) = split(self);
-        let (other_reader, other_writer) = split(other);
-        tokio::try_join!(
-            Self::pipe(this_reader, other_writer), 
-            Self::pipe(other_reader, this_writer),
-        )?;
-        Ok(())
-    }
+#[derive(Debug, Deserialize)]
+struct Config {
+    default: ServerConfig,
+    servers: Vec<ServerConfig>,
+}
 
-    async fn pipe<T, U>(mut reader: ReadHalf<T>, mut writer: WriteHalf<U>) -> Result<()> 
-        where T: AsyncRead + Unpin + Send, U: AsyncWrite + Unpin + Send
-    {
-        let mut buffer = vec![0; BUFFER_SIZE];
-        loop {
-            let n = reader.read(&mut buffer).await?;
-            if n == 0 {
-                break;
-            }    
-            writer.write_all(&buffer[..n]).await?;
-            writer.flush().await?;
+#[derive(Debug)]
+struct ServerConfig {
+    url: Url,
+    blacklist: BlackList,
+}
+
+impl<'de> Deserialize<'de> for ServerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        #[derive(Deserialize)]
+        struct TempServerConfig {
+            url: String,
+            blacklist: String,
         }
-        Ok(())
+
+        let temp = TempServerConfig::deserialize(deserializer)?;
+        let patterns: Vec<String> = fs::read_to_string(&temp.blacklist)
+            .map_err(serde::de::Error::custom)?
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.starts_with("//"))
+            .collect();
+        let blacklist = AhoCorasick::new(&patterns)
+            .map_err(serde::de::Error::custom)?;
+        Ok(ServerConfig {
+            url: temp.url.parse().map_err(serde::de::Error::custom)?,
+            blacklist,
+        })   
     }
 }
 
@@ -65,16 +73,33 @@ impl Pipe for TcpStream {
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
-    let blacklist = Arc::new(load_blacklist("full_blacklist").await?);
-    let addr: SocketAddr = "127.0.0.1:8881".parse()?;
+    let args = Args::parse();
+    let config = if let Some(ref config) = args.config {
+        load_config(config).await?
+    } else {
+        Config {
+            default: ServerConfig {
+                url: "tcp://127.0.0.1:8080".parse()?, 
+                blacklist: load_blacklist("default_blacklist").await?
+            },
+            servers: vec![],
+        }
+    };
+    let config = Arc::new(config);
+    // info!("Config: {config:?}");
+    let url = &config.default.url;
+    let addr: SocketAddr = (format!("{}:{}", 
+        url.host().context("Unsupported url {url}")?, 
+        url.port().context("Unsupported url {url}")?
+    )).parse()?;
     let listener = TcpListener::bind(&addr).await?;
     info!("Proxy has started at {addr}");
     let mut i = 0;
     loop {
-        let blacklist = Arc::clone(&blacklist);
+        let config = Arc::clone(&config);
         let (local_stream, addr) = listener.accept().await?;
         debug!("Accepted new client id={i} addr={addr}");
-        let mut client = Client::new(i, local_stream, blacklist);
+        let mut client = Client::new(i, local_stream, config);
         tokio::task::spawn(async move {
             if let Err(err) = client.handle().await {
                 error!("Client {i}: {err}");
@@ -85,6 +110,14 @@ async fn main() -> Result<()> {
         });
         i += 1;
     }
+}
+
+
+async fn load_config(path: &str) -> Result<Config> {
+    let mut buffer = String::new();
+    File::open(path).await?.read_to_string(&mut buffer).await?;
+    let config: Config = serde_yaml::from_str(&buffer)?;
+    Ok(config)
 }
 
 
@@ -103,15 +136,15 @@ async fn load_blacklist(filename: &str) -> Result<BlackList> {
 struct Client {
     id: usize,
     local_stream: TcpStream,
-    blacklist: Arc<BlackList>,
+    config: Arc<Config>,
 }
 
 impl Client {
-    fn new(id: usize, local_stream: TcpStream, blacklist: Arc<BlackList>) -> Self {
+    fn new(id: usize, local_stream: TcpStream, config: Arc<Config>) -> Self {
         Self {
             id,
             local_stream,
-            blacklist,
+            config,
         }
     }
 
@@ -175,6 +208,36 @@ impl Client {
         let host = String::from_utf8_lossy(host_part).to_string();
         let port: u16 = String::from_utf8_lossy(port_part).parse()?;    
         // Connect to remote stream
+        for server in self.config.servers.iter() {
+            if !server.blacklist.is_match(&host) {
+                continue;
+            }
+            debug!("Client {}: server {} matched {host}", self.id, server.url);
+            let proxy_addr: SocketAddr = format!("{}:{}",
+                server.url.host().context(format!("Unsupported url {}", server.url))?,
+                server.url.port().context(format!("Unsupported url {}", server.url))?
+            ).parse()?;
+            let target_addr = format!("{host}:{port}");
+            match server.url.scheme() {
+                "socks5" => {
+                    let mut stream = Socks5Stream::connect(proxy_addr, target_addr).await?;
+                    self.local_stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
+                    debug!("Client {}: sent 200 OK", self.id);
+                    self.local_stream.pipe_stream(&mut stream).await?;
+                }
+                "tcp" => {
+                    let mut stream = TcpStream::connect(proxy_addr).await?;
+                    stream.write_all(format!(
+                        "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\n\r\n", 
+                        host, host
+                    ).as_bytes()).await?;
+                    self.local_stream.pipe_stream(&mut stream).await?;
+                }
+                _ => bail!("Unsupported url {}", server.url)
+            }
+    
+            return Ok(());
+        }
         let mut tcp_stream = TcpStream::connect((host.clone(), port)).await?;
         debug!("Client {}: connected to remote stream {host}:{port}", self.id);
         // Respond OK
@@ -182,7 +245,8 @@ impl Client {
         debug!("Client {}: sent 200 OK", self.id);
         // Process stream
         if port == 443 {
-            self.fragment_stream(&mut tcp_stream).await?;
+            let config = self.config.clone();
+            self.fragment_stream(&mut tcp_stream, &config.default.blacklist).await?;
         } 
         self.local_stream.pipe_stream(&mut tcp_stream).await?;
         Ok(())
@@ -205,14 +269,15 @@ impl Client {
         parts
     }
 
-    async fn fragment_stream(&mut self, remote_stream: &mut TcpStream) -> Result<()> {
+    async fn fragment_stream(&mut self, remote_stream: &mut TcpStream, blacklist: &BlackList) -> Result<()> {
         let mut buffer = vec![0; BUFFER_SIZE];
         let n = self.local_stream.read(&mut buffer).await?;
         buffer.truncate(n);
+        debug!("Client {}: fragment read {n} bytes", self.id);
         // debug!("Client {}: fragment buffer\n{}", self.id, String::from_utf8_lossy(&buffer));
         let (_head, mut remaining_data) = buffer.split_at_checked(5)
             .context("Unsupported request")?;
-        for mtch in self.blacklist.find_iter(remaining_data) {
+        for mtch in blacklist.find_iter(remaining_data) {
             let w = mtch.end() - mtch.start();
             let mid = mtch.end() - w / 2;
             if let Some((first, last)) = &remaining_data.split_at_checked(mid) {
@@ -245,3 +310,45 @@ impl Client {
     }
 }
 
+
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+
+trait Pipe: AsyncReadWrite {
+    async fn pipe_stream<T>(&mut self, other: &mut T) -> Result<()>
+        where T: AsyncReadWrite;
+    
+    async fn pipe<T, U>(reader: ReadHalf<T>, writer: WriteHalf<U>) -> Result<()>
+        where T: AsyncRead + Unpin + Send, U: AsyncWrite + Unpin + Send;
+}
+
+impl Pipe for TcpStream {
+    async fn pipe_stream<T>(&mut self, other: &mut T) -> Result<()> 
+        where T: AsyncReadWrite
+    {
+        let (this_reader, this_writer) = split(self);
+        let (other_reader, other_writer) = split(other);
+        tokio::try_join!(
+            Self::pipe(this_reader, other_writer), 
+            Self::pipe(other_reader, this_writer),
+        )?;
+        Ok(())
+    }
+
+    async fn pipe<T, U>(mut reader: ReadHalf<T>, mut writer: WriteHalf<U>) -> Result<()> 
+        where T: AsyncRead + Unpin + Send, U: AsyncWrite + Unpin + Send
+    {
+        let mut buffer = vec![0; BUFFER_SIZE];
+        loop {
+            let n = reader.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }    
+            writer.write_all(&buffer[..n]).await?;
+            writer.flush().await?;
+        }
+        Ok(())
+    }
+}
