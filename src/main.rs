@@ -15,7 +15,6 @@ use tokio::{
     io::{
         AsyncRead, AsyncWrite, 
         AsyncReadExt, AsyncWriteExt, 
-        ReadHalf, WriteHalf, 
         split
     }, 
     net::{TcpStream, TcpListener},
@@ -353,15 +352,14 @@ impl Client {
         debug!("Client {}: sent 200 OK", self.id);
         // Process stream
         if port == 443 {
-            let config = self.config.clone();
-            self.fragment_stream(&mut tcp_stream, &config.read().await.default.blacklist).await?;
+            self.fragment_stream(&mut tcp_stream).await?;
         } 
         self.local_stream.pipe_stream(&mut tcp_stream).await?;
         Ok(())
     }
 
     
-    async fn fragment_stream(&mut self, remote_stream: &mut TcpStream, blacklist: &BlackList) -> Result<()> {
+    async fn fragment_stream(&mut self, remote_stream: &mut TcpStream) -> Result<()> {
         let mut buffer = vec![0; BUFFER_SIZE];
         let n = self.local_stream.read(&mut buffer).await?;
         buffer.truncate(n);
@@ -369,7 +367,8 @@ impl Client {
         // debug!("Client {}: fragment buffer\n{}", self.id, String::from_utf8_lossy(&buffer));
         let (_head, mut remaining_data) = buffer.split_at_checked(5)
             .context("Unsupported request")?;
-        for mtch in blacklist.find_iter(remaining_data) {
+        let config = self.config.read().await;
+        for mtch in config.default.blacklist.find_iter(remaining_data) {
             let w = mtch.end() - mtch.start();
             let mid = mtch.end() - w / 2;
             if let Some((first, last)) = &remaining_data.split_at_checked(mid) {
@@ -378,7 +377,8 @@ impl Client {
                 remote_stream.write_all(&fragment).await?;
                 remote_stream.flush().await?;
             };
-        } 
+        }
+        drop(config);
         let part = self.process_fragment(remaining_data);
         remote_stream.write_all(&part).await?;
         remote_stream.flush().await?;
@@ -411,36 +411,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 trait Pipe: AsyncReadWrite {
     async fn pipe_stream<T>(&mut self, other: &mut T) -> Result<()>
         where T: AsyncReadWrite;
-    
-    async fn pipe<T, U>(reader: ReadHalf<T>, writer: WriteHalf<U>) -> Result<()>
-        where T: AsyncRead + Unpin + Send, U: AsyncWrite + Unpin + Send;
 }
 
 impl Pipe for TcpStream {
     async fn pipe_stream<T>(&mut self, other: &mut T) -> Result<()> 
         where T: AsyncReadWrite
     {
-        let (this_reader, this_writer) = split(self);
-        let (other_reader, other_writer) = split(other);
+        let (mut this_reader, mut this_writer) = split(self);
+        let (mut other_reader, mut other_writer) = split(other);
         tokio::try_join!(
-            Self::pipe(this_reader, other_writer), 
-            Self::pipe(other_reader, this_writer),
+            tokio::io::copy(&mut this_reader, &mut other_writer),
+            tokio::io::copy(&mut other_reader, &mut this_writer),
         )?;
-        Ok(())
-    }
-
-    async fn pipe<T, U>(mut reader: ReadHalf<T>, mut writer: WriteHalf<U>) -> Result<()> 
-        where T: AsyncRead + Unpin + Send, U: AsyncWrite + Unpin + Send
-    {
-        let mut buffer = vec![0; BUFFER_SIZE];
-        loop {
-            let n = reader.read(&mut buffer).await?;
-            if n == 0 {
-                break;
-            }    
-            writer.write_all(&buffer[..n]).await?;
-            writer.flush().await?;
-        }
         Ok(())
     }
 }

@@ -18,6 +18,11 @@ Make sure you have the following installed on your system:
 - [Rust](https://www.rust-lang.org/tools/install)
 - [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) (comes with Rust)
 
+
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
 #### Clone the Repository
 First, clone the repository to your local machine:
 
@@ -74,9 +79,6 @@ servers:
 cargo run --release -- --config your_config.yaml
 ```
 With this configuration, any requests to twimg.com will be routed through the Tor proxy, while all other traffic will continue to be processed by the default proxy at 127.0.0.1:8080. This allows you to bypass restrictions on specific hosts without affecting your overall browsing experience.
-
-#### Conclusion
-The Blacklists feature helps you manage your proxy settings dynamically, ensuring that you can access the content you need without being hindered by IP blocks. 
 
 ## Contributing
 If you would like to contribute to this project, please follow these steps:
