@@ -1,12 +1,17 @@
-use std::{fs, net::SocketAddr, sync::Arc};
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use std::{
+    fs, 
+    net::SocketAddr, 
+    path::PathBuf, 
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH}
+};
+use aho_corasick::{AhoCorasick, Input, FindIter};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use log::{debug, info, error};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Deserializer};
 use tokio::{
-    fs::File, 
     io::{
         AsyncRead, AsyncWrite, 
         AsyncReadExt, AsyncWriteExt, 
@@ -14,6 +19,7 @@ use tokio::{
         split
     }, 
     net::{TcpStream, TcpListener},
+    sync::RwLock,
 };
 use tokio_socks::tcp::Socks5Stream;
 use url::Url;
@@ -22,23 +28,132 @@ use url::Url;
 const BUFFER_SIZE: usize = 4096;
 
 
-type BlackList = AhoCorasick;
+#[derive(Debug, Clone)]
+struct BlackList {
+    manager: AhoCorasick,
+    path: PathBuf,
+    last_modified: SystemTime,
+}
+
+impl BlackList {
+    fn is_match<'h, I>(&self, input: I) -> bool 
+        where I: Into<Input<'h>>
+    {
+        self.manager.is_match(input)
+    }
+
+    fn find_iter<'a, 'h, I>(&'a self, input: I) -> FindIter<'a, 'h>
+        where I: Into<Input<'h>>
+    {
+        self.manager.find_iter(input) 
+    }
+
+    fn is_changed(&self) -> Result<bool> {
+        let current_modified = fs::metadata(&self.path)?.modified()?;
+        Ok(current_modified > self.last_modified)
+    }
+}
+
+impl TryFrom<PathBuf> for BlackList {
+    type Error = anyhow::Error;
+
+    fn try_from(path: PathBuf) -> Result<Self> {
+        let patterns: Vec<String> = fs::read_to_string(&path)?
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.starts_with("//"))
+            .collect();
+        Ok(Self {
+            manager: AhoCorasick::new(&patterns)?,
+            last_modified: fs::metadata(&path)?.modified()?,
+            path,
+        })
+    }
+}
 
 
 #[derive(Parser)]
 struct Args {
     /// Path to the configuration file
     #[clap(short, long)]
-    config: Option<String>,
+    config: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+
+#[derive(Debug)]
 struct Config {
     default: ServerConfig,
     servers: Vec<ServerConfig>,
+    path: Option<PathBuf>,
+    last_modified: SystemTime,
 }
 
-#[derive(Debug)]
+impl Config {
+    fn new(blacklist: PathBuf, servers: Vec<ServerConfig>) -> Result<Self> {
+        Ok(Config {
+            default: ServerConfig {
+                url: "tcp://127.0.0.1:8080".parse()?, 
+                blacklist: BlackList::try_from(blacklist)?,
+            },
+            servers,
+            path: None,
+            last_modified: UNIX_EPOCH,
+        })
+    }
+
+    fn is_changed(&self) -> Result<bool> {
+        if let Some(ref path) = self.path {
+            let updated = fs::metadata(path)?.modified()? > self.last_modified;
+            for server in self.servers.iter() {
+                if server.blacklist.is_changed()? {
+                    return Ok(true);
+                }
+            }
+            return Ok(updated);
+        }
+        Ok(false)
+    }
+
+    fn update(&mut self) -> Result<()> {
+        if let Some(ref path) = self.path {
+            *self = Self::try_from(path.clone())?; 
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        #[derive(Deserialize)]
+        struct TempConfig {
+            default: ServerConfig,
+            servers: Vec<ServerConfig>,
+        }
+
+        let temp = TempConfig::deserialize(deserializer)?;
+        Ok(Config {
+            default: temp.default,
+            servers: temp.servers,
+            path: None,
+            last_modified: UNIX_EPOCH,
+        })   
+    }
+}
+
+impl TryFrom<PathBuf> for Config {
+    type Error = anyhow::Error;
+
+    fn try_from(value: PathBuf) -> std::result::Result<Self, Self::Error> {
+        let buffer = fs::read_to_string(&value)?;
+        let mut config: Config = serde_yaml::from_str(&buffer)?;
+        config.last_modified = fs::metadata(&value)?.modified()?;
+        config.path = Some(value);
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ServerConfig {
     url: Url,
     blacklist: BlackList,
@@ -50,22 +165,15 @@ impl<'de> Deserialize<'de> for ServerConfig {
         #[derive(Deserialize)]
         struct TempServerConfig {
             url: String,
-            blacklist: String,
+            blacklist: PathBuf,
         }
 
         let temp = TempServerConfig::deserialize(deserializer)?;
-        let patterns: Vec<String> = fs::read_to_string(&temp.blacklist)
-            .map_err(serde::de::Error::custom)?
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && !s.starts_with("//"))
-            .collect();
-        let blacklist = AhoCorasick::new(&patterns)
-            .map_err(serde::de::Error::custom)?;
         Ok(ServerConfig {
             url: temp.url.parse().map_err(serde::de::Error::custom)?,
-            blacklist,
-        })   
+            blacklist: BlackList::try_from(temp.blacklist)
+                .map_err(serde::de::Error::custom)?,
+        })
     }
 }
 
@@ -74,18 +182,11 @@ impl<'de> Deserialize<'de> for ServerConfig {
 async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
-    let config = if let Some(ref config) = args.config {
-        load_config(config).await?
+    let config = if let Some(path) = args.config {
+        Config::try_from(path)?
     } else {
-        Config {
-            default: ServerConfig {
-                url: "tcp://127.0.0.1:8080".parse()?, 
-                blacklist: load_blacklist("default_blacklist").await?
-            },
-            servers: vec![],
-        }
+        Config::new(PathBuf::from("default_blacklist"), vec![])?
     };
-    let config = Arc::new(config);
     // info!("Config: {config:?}");
     let url = &config.default.url;
     let addr: SocketAddr = (format!("{}:{}", 
@@ -93,13 +194,13 @@ async fn main() -> Result<()> {
         url.port().context("Unsupported url {url}")?
     )).parse()?;
     let listener = TcpListener::bind(&addr).await?;
+    let config = Arc::new(RwLock::new(config));
     info!("Proxy has started at {addr}");
     let mut i = 0;
     loop {
-        let config = Arc::clone(&config);
         let (local_stream, addr) = listener.accept().await?;
         debug!("Accepted new client id={i} addr={addr}");
-        let mut client = Client::new(i, local_stream, config);
+        let mut client = Client::new(i, local_stream, Arc::clone(&config));
         tokio::task::spawn(async move {
             if let Err(err) = client.handle().await {
                 error!("Client {i}: {err}");
@@ -109,38 +210,39 @@ async fn main() -> Result<()> {
             }
         });
         i += 1;
+        if config.read().await.is_changed()? {
+            config.write().await.update()?;     
+        }
     }
 }
 
 
-async fn load_config(path: &str) -> Result<Config> {
-    let mut buffer = String::new();
-    File::open(path).await?.read_to_string(&mut buffer).await?;
-    let config: Config = serde_yaml::from_str(&buffer)?;
-    Ok(config)
-}
-
-
-async fn load_blacklist(filename: &str) -> Result<BlackList> {
-    let mut buffer = String::new();
-    File::open(filename).await?.read_to_string(&mut buffer).await?;
-    let blacklist: Vec<String> = buffer.split('\n')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && !s.starts_with("//"))
-        .collect();
-    let blacklist = AhoCorasickBuilder::new().build(&blacklist)?;
-    Ok(blacklist)
+fn split_buffer<'a>(buffer: &'a [u8], delimiter: &'a [u8]) -> Vec<&'a [u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while let Some(pos) = buffer[start..]
+        .windows(delimiter.len())
+        .position(|window| window == delimiter) 
+    {
+        let end = start + pos;
+        parts.push(&buffer[start..end]);
+        start = end + delimiter.len();
+    }
+    if start < buffer.len() {
+        parts.push(&buffer[start..]);
+    }
+    parts
 }
 
 
 struct Client {
     id: usize,
     local_stream: TcpStream,
-    config: Arc<Config>,
+    config: Arc<RwLock<Config>>,
 }
 
 impl Client {
-    fn new(id: usize, local_stream: TcpStream, config: Arc<Config>) -> Self {
+    fn new(id: usize, local_stream: TcpStream, config: Arc<RwLock<Config>>) -> Self {
         Self {
             id,
             local_stream,
@@ -158,12 +260,12 @@ impl Client {
         }
         debug!("Client {}: read {n} bytes", self.id);
         debug!("Client {}: buffer\n{}", self.id, String::from_utf8_lossy(&buffer));
-        let parts = self.split_buffer(&buffer, b"\r\n\r\n").await;
+        let parts = split_buffer(&buffer, b"\r\n\r\n");
         if parts.is_empty() {
             bail!("Unsupported request");
         }
         // Parse lines
-        let lines: Vec<&[u8]> = self.split_buffer(parts[0], b"\r\n").await;
+        let lines: Vec<&[u8]> = split_buffer(parts[0], b"\r\n");
         if lines.is_empty() {
             bail!("Unsupported request");
         }
@@ -208,17 +310,24 @@ impl Client {
         let host = String::from_utf8_lossy(host_part).to_string();
         let port: u16 = String::from_utf8_lossy(port_part).parse()?;    
         // Connect to remote stream
-        for server in self.config.servers.iter() {
-            if !server.blacklist.is_match(&host) {
-                continue;
-            }
-            debug!("Client {}: server {} matched {host}", self.id, server.url);
+        let server_count = {self.config.read().await.servers.len()};
+        for i in 0..server_count {
+            // Config may change any time
+            let server_url = if let Some(server) = self.config.read().await.servers.get(i) {
+                if !server.blacklist.is_match(&host) {
+                    continue;
+                }
+                server.url.clone()
+            } else {
+                break;
+            };
+            debug!("Client {}: server {} matched {host}", self.id, server_url);
             let proxy_addr: SocketAddr = format!("{}:{}",
-                server.url.host().context(format!("Unsupported url {}", server.url))?,
-                server.url.port().context(format!("Unsupported url {}", server.url))?
+                server_url.host().context(format!("Unsupported url {}", server_url))?,
+                server_url.port().context(format!("Unsupported url {}", server_url))?
             ).parse()?;
             let target_addr = format!("{host}:{port}");
-            match server.url.scheme() {
+            match server_url.scheme() {
                 "socks5" => {
                     let mut stream = Socks5Stream::connect(proxy_addr, target_addr).await?;
                     self.local_stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
@@ -233,9 +342,8 @@ impl Client {
                     ).as_bytes()).await?;
                     self.local_stream.pipe_stream(&mut stream).await?;
                 }
-                _ => bail!("Unsupported url {}", server.url)
+                _ => bail!("Unsupported url {}", server_url)
             }
-    
             return Ok(());
         }
         let mut tcp_stream = TcpStream::connect((host.clone(), port)).await?;
@@ -246,29 +354,13 @@ impl Client {
         // Process stream
         if port == 443 {
             let config = self.config.clone();
-            self.fragment_stream(&mut tcp_stream, &config.default.blacklist).await?;
+            self.fragment_stream(&mut tcp_stream, &config.read().await.default.blacklist).await?;
         } 
         self.local_stream.pipe_stream(&mut tcp_stream).await?;
         Ok(())
     }
 
-    async fn split_buffer<'a, 'b>(&'a self, buffer: &'b [u8], delimiter: &'b [u8]) -> Vec<&'b [u8]> {
-        let mut parts = Vec::new();
-        let mut start = 0;
-        while let Some(pos) = buffer[start..]
-            .windows(delimiter.len())
-            .position(|window| window == delimiter) 
-        {
-            let end = start + pos;
-            parts.push(&buffer[start..end]);
-            start = end + delimiter.len();
-        }
-        if start < buffer.len() {
-            parts.push(&buffer[start..]);
-        }
-        parts
-    }
-
+    
     async fn fragment_stream(&mut self, remote_stream: &mut TcpStream, blacklist: &BlackList) -> Result<()> {
         let mut buffer = vec![0; BUFFER_SIZE];
         let n = self.local_stream.read(&mut buffer).await?;
