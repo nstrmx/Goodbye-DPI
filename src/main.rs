@@ -312,14 +312,16 @@ impl Client {
         let server_count = {self.config.read().await.servers.len()};
         for i in 0..server_count {
             // Config may change any time
-            let server_url = if let Some(server) = self.config.read().await.servers.get(i) {
+            let server_url = {
+                let config = self.config.read().await;
+                if let Some(server) = config.servers.get(i) {
                 if !server.blacklist.is_match(&host) {
                     continue;
                 }
                 server.url.clone()
             } else {
                 break;
-            };
+            }};
             debug!("Client {}: server {} matched {host}", self.id, server_url);
             let proxy_addr: SocketAddr = format!("{}:{}",
                 server_url.host().context(format!("Unsupported url {}", server_url))?,
