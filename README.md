@@ -75,9 +75,6 @@ cargo run --release -- --config your_config.yaml
 ```
 With this configuration, any requests to twimg.com will be routed through the Tor proxy, while all other traffic will continue to be processed by the default proxy at 127.0.0.1:8080. This allows you to bypass restrictions on specific hosts without affecting your overall browsing experience.
 
-#### Conclusion
-The Blacklists feature helps you manage your proxy settings dynamically, ensuring that you can access the content you need without being hindered by IP blocks. 
-
 ## Contributing
 If you would like to contribute to this project, please follow these steps:
 
@@ -87,3 +84,5 @@ If you would like to contribute to this project, please follow these steps:
 4. Push to the branch (git push origin feature-branch).
 5. Create a new Pull Request.
 
+## License
+GNU General Public License v3.0
