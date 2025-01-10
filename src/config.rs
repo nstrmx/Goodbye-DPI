@@ -1,5 +1,5 @@
-use std::{ fs, path::PathBuf, sync::Arc, time::{SystemTime, UNIX_EPOCH} };
-use aho_corasick::{AhoCorasick, Input, FindIter};
+use std::{ fs, ops::Deref, path::PathBuf, sync::Arc, time::{SystemTime, UNIX_EPOCH} };
+use aho_corasick::AhoCorasick;
 use anyhow::Result;
 use log::debug;
 use serde::{Deserialize, Deserializer};
@@ -36,15 +36,15 @@ impl Config {
         })
     }
 
-    pub fn is_changed(&self) -> Result<bool> {
+    pub fn changed(&self) -> Result<bool> {
         if let Some(ref path) = self.path {
-            let updated = fs::metadata(path)?.modified()? > self.last_modified;
+            let modified = fs::metadata(path)?.modified()? > self.last_modified;
             for server in self.servers.iter() {
-                if server.blacklist.is_changed()? {
+                if server.blacklist.changed()? {
                     return Ok(true);
                 }
             }
-            return Ok(updated);
+            return Ok(modified);
         }
         Ok(false)
     }
@@ -121,25 +121,13 @@ impl<'de> Deserialize<'de> for ServerConfig {
 
 #[derive(Debug)]
 pub struct BlackList {
-    manager: AhoCorasick,
+    handler: AhoCorasick,
     path: PathBuf,
     last_modified: SystemTime,
 }
 
 impl BlackList {
-    pub fn is_match<'h, I>(&self, input: I) -> bool 
-        where I: Into<Input<'h>>
-    {
-        self.manager.is_match(input)
-    }
-
-    pub fn find_iter<'a, 'h, I>(&'a self, input: I) -> FindIter<'a, 'h>
-        where I: Into<Input<'h>>
-    {
-        self.manager.find_iter(input) 
-    }
-
-    pub fn is_changed(&self) -> Result<bool> {
+    pub fn changed(&self) -> Result<bool> {
         let current_modified = fs::metadata(&self.path)?.modified()?;
         Ok(current_modified > self.last_modified)
     }
@@ -155,12 +143,17 @@ impl TryFrom<PathBuf> for BlackList {
             .filter(|s| !s.is_empty() && !s.starts_with("//"))
             .collect();
         Ok(Self {
-            manager: AhoCorasick::new(&patterns)?,
+            handler: AhoCorasick::new(&patterns)?,
             last_modified: fs::metadata(&path)?.modified()?,
             path,
         })
     }
 }
 
-
-
+impl Deref for BlackList {
+    type Target = AhoCorasick;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.handler
+    }
+}

@@ -28,46 +28,40 @@ impl Client {
 
     pub async fn handle(&mut self) -> Result<()> {
         // Read stream
-        let buffer_size = {self.config.read().await.buffer_size};
+        let buffer_size = self.config.read().await.buffer_size;
         debug!("Client {}: buffer size {buffer_size}", self.id);
         let mut buffer = vec![0; buffer_size];
         let n = self.local_stream.read(&mut buffer).await?;
-        buffer.truncate(n);
         if n == 0 {
             return Ok(());
         }
+        buffer.truncate(n);
         debug!("Client {}: read {n} bytes", self.id);
         debug!("Client {}: buffer\n{}", self.id, String::from_utf8_lossy(&buffer));
         let parts = split_buffer(&buffer, b"\r\n\r\n");
-        if parts.is_empty() {
-            bail!("Unsupported request");
-        }
+        let first_part = parts.first().context("Unsupported request")?;
         // Parse lines
-        let lines: Vec<&[u8]> = split_buffer(parts[0], b"\r\n");
-        if lines.is_empty() {
-            bail!("Unsupported request");
-        }
-        let request_line = lines[0];
+        let lines: Vec<&[u8]> = split_buffer(first_part, b"\r\n");
+        let request_line = lines.first().context("Unsupported request")?;
         let parts: Vec<&[u8]> = request_line.split(|&b| b == b' ').collect();
-        if parts.len() < 3 {
-            bail!("Unsupported request");
-        }
+        let mut parts = parts.iter();
+        let method = parts.next().context("Unsupported request")?;
+        let host = parts.next().context("Unsupported request")?;
         // Open remote TCP stream
-        match parts[0] {
-            b"CONNECT" => self.handle_https(parts[1]).await?,
-            _ => self.handle_http(parts[1], &buffer).await?,
+        match method {
+            &b"CONNECT" => self.handle_https(host).await?,
+            _ => self.handle_http(host, &buffer).await?,
         }
         Ok(())
     }
 
     async fn handle_http(&mut self, target: &[u8], buffer: &[u8]) -> Result<()> {
-        let url = String::from_utf8_lossy(target).to_string();
-        let parsed_url = Url::parse(&url)?;
-        let host = parsed_url.host_str().context("Failed to parse host")?.to_string();
-        match parsed_url.scheme() {
+        let url = Url::parse(&String::from_utf8_lossy(target))?;
+        let host = url.host_str().context("Failed to parse host")?;
+        match url.scheme() {
             "http" => {
-                let port = parsed_url.port().unwrap_or(80);
-                let ip_addr = { self.config.read().await.dns.lookup_ip(&host).await? };
+                let port = url.port().unwrap_or(80);
+                let ip_addr = { self.config.read().await.dns.lookup_ip(host).await? };
                 let target_addr = format!("{}:{}", ip_addr, port);
                 let mut tcp_stream = TcpStream::connect(target_addr).await?;
                 tcp_stream.write_all(buffer).await?;
@@ -81,30 +75,29 @@ impl Client {
 
     async fn handle_https(&mut self, target: &[u8]) -> Result<()> {
         let target_parts: Vec<&[u8]> = target.split(|&b| b == b':').collect();
-        if target_parts.len() != 2 {
-            bail!("Unsupported request");
-        }
-        let host_part = target_parts[0];
-        let port_part = target_parts[1];
-        let host = String::from_utf8_lossy(host_part).to_string();
+        let mut target_parts = target_parts.iter();
+        let host_part = target_parts.next().context("Unsupported target")?;
+        let port_part = target_parts.next().context("Unsupported target")?;
+        let host = String::from_utf8_lossy(host_part);
         let port: u16 = String::from_utf8_lossy(port_part).parse()?;    
-        let ip_addr = { self.config.read().await.dns.lookup_ip(&host).await? };
+        let ip_addr = self.config.read().await.dns.lookup_ip(&host).await?;
         let target_addr = format!("{ip_addr}:{port}");
         debug!("Client {}: target addr {target_addr}", self.id);
         // Connect to remote stream
-        let server_count = {self.config.read().await.servers.len()};
+        let server_count = self.config.read().await.servers.len();
         for i in 0..server_count {
             // Config may change any time
             let server_url = {
                 let config = self.config.read().await;
                 if let Some(server) = config.servers.get(i) {
-                if !server.blacklist.is_match(&host) {
-                    continue;
+                    if !server.blacklist.is_match(&*host) {
+                        continue;
+                    }
+                    server.url.clone()
+                } else {
+                    break;
                 }
-                server.url.clone()
-            } else {
-                break;
-            }};
+            };
             debug!("Client {}: server {} matched {host}", self.id, server_url);
             let proxy_addr: SocketAddr = format!("{}:{}",
                 server_url.host().context(format!("Unsupported url {}", server_url))?,
@@ -120,7 +113,9 @@ impl Client {
                 "tcp" => {
                     let mut stream = TcpStream::connect(proxy_addr).await?;
                     stream.write_all(format!(
-                        "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\n\r\n", 
+                        "CONNECT {} HTTP/1.1\r\n\
+                         Host: {}\r\n\
+                         Proxy-Connection: keep-alive\r\n\r\n", 
                         host, host
                     ).as_bytes()).await?;
                     self.local_stream.pipe_stream(&mut stream).await?;
@@ -144,16 +139,20 @@ impl Client {
 
     
     async fn fragment_stream(&mut self, remote_stream: &mut TcpStream) -> Result<()> {
-        let buffer_size = {self.config.read().await.buffer_size};
+        let buffer_size = self.config.read().await.buffer_size;
         let mut buffer = vec![0; buffer_size];
         let n = self.local_stream.read(&mut buffer).await?;
         buffer.truncate(n);
         debug!("Client {}: fragment read {n} bytes", self.id);
-        // debug!("Client {}: fragment buffer\n{}", self.id, String::from_utf8_lossy(&buffer));
         let (_head, mut remaining_data) = buffer.split_at_checked(5)
             .context("Unsupported request")?;
-        let config = self.config.read().await;
-        for mtch in config.default.blacklist.find_iter(remaining_data) {
+        let matches: Vec<aho_corasick::Match> = {
+            self.config.read().await
+                .default.blacklist
+                .find_iter(remaining_data)
+                .collect()
+        };
+        for mtch in matches {
             let w = mtch.end() - mtch.start();
             let mid = mtch.end() - w / 2;
             if let Some((first, last)) = &remaining_data.split_at_checked(mid) {
@@ -163,7 +162,6 @@ impl Client {
                 remote_stream.flush().await?;
             };
         }
-        drop(config);
         let part = self.process_fragment(remaining_data);
         remote_stream.write_all(&part).await?;
         remote_stream.flush().await?;
@@ -188,19 +186,19 @@ impl Client {
 }
 
 
-trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
 
 trait Pipe: AsyncReadWrite {
     async fn pipe_stream<T>(&mut self, other: &mut T) -> Result<()>
-        where T: AsyncReadWrite;
+        where T: AsyncReadWrite + Unpin;
 }
 
 impl Pipe for TcpStream {
     async fn pipe_stream<T>(&mut self, other: &mut T) -> Result<()> 
-        where T: AsyncReadWrite
+        where T: AsyncReadWrite + Unpin
     {
         let (mut this_reader, mut this_writer) = split(self);
         let (mut other_reader, mut other_writer) = split(other);
@@ -213,7 +211,7 @@ impl Pipe for TcpStream {
 }
 
 
-fn split_buffer<'a>(buffer: &'a [u8], delimiter: &'a [u8]) -> Vec<&'a [u8]> {
+fn split_buffer<'a>(buffer: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
     let mut parts = Vec::new();
     let mut start = 0;
     while let Some(pos) = buffer[start..]
