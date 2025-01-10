@@ -5,14 +5,13 @@ use serde::{ de::Error as DeError, Deserialize };
 use trust_dns_resolver::{ config::{ResolverConfig, ResolverOpts}, TokioAsyncResolver as Resolver};
 
 
-#[derive(Debug, Default)]
 pub struct DnsResolver {
-    resolver: Wrapper<Resolver>,
+    resolver: Resolver,
 }
 
 impl DnsResolver {
     pub async fn lookup_ip(&self, host: &str) -> Result<IpAddr> {
-        match self.resolver.value.lookup_ip(host).await {
+        match self.resolver.lookup_ip(host).await {
             Ok(response) => {
                 let addrs: Vec<IpAddr> = response.iter().collect();
                 let rand_idx = thread_rng().gen_range(0..addrs.len());
@@ -23,26 +22,15 @@ impl DnsResolver {
     }
 }
 
-
-struct Wrapper<T> {
-    value: T,
-}
-
-impl<T> Wrapper<T> {
-    fn new(value: T) -> Self {
-        Self{ value }
-    }
-}
-
-impl std::fmt::Debug for Wrapper<Resolver> {
+impl std::fmt::Debug for DnsResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Resolver")
+        f.write_str("DnsResolver")
     }
 }
 
-impl Default for Wrapper<Resolver> {
+impl Default for DnsResolver {
     fn default() -> Self {
-        Self{ value: Resolver::tokio(
+        Self{ resolver: Resolver::tokio(
             ResolverConfig::default(), ResolverOpts::default()
         )}
     }
@@ -73,7 +61,7 @@ impl<'de> Deserialize<'de> for DnsResolver {
         };
         let resolver = Resolver::tokio(config, ResolverOpts::default());
         Ok(DnsResolver { 
-            resolver: Wrapper::new(resolver),
+            resolver,
         })
     }
 }
