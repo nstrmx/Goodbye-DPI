@@ -66,8 +66,8 @@ Your configuration might look something like this:
 # Your default proxy (Goodbye-DPI)
 buffer_size: 4096
 dns:
-  server: cloudflare
-  over: https
+  provider: cloudflare
+  protocol: https
 default: 
   url: "tcp//127.0.0.1:8080"
   blacklist: "default_blacklist"
@@ -109,8 +109,8 @@ Example Configuration
 ```yaml
 buffer_size: 4096
 dns:
-  server: cloudflare
-  over: https
+  provider: cloudflare
+  protocol: https
 default: 
   url: "tcp//127.0.0.1:8080"
   blacklist: "default_blacklist"

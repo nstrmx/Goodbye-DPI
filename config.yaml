@@ -1,7 +1,7 @@
 buffer_size: 4096
 dns:
-  server: cloudflare
-  over: https
+  provider: cloudflare
+  protocol: https
 default: 
   url: "tcp://127.0.0.1:8080"
   blacklist: "default_blacklist"
