@@ -29,7 +29,6 @@ async fn main() -> Result<()> {
     } else {
         Config::new(PathBuf::from("default_blacklist"), vec![])?
     };
-    // info!("Config: {config:?}");
     let url = &config.default.url;
     let addr: SocketAddr = (format!("{}:{}", 
         url.host().context("Unsupported url {url}")?, 
@@ -52,8 +51,9 @@ async fn main() -> Result<()> {
             }
         });
         i += 1;
-        if config.read().await.is_changed()? {
-            config.write().await.update()?;     
+        let changed = { config.read().await.changed()? };
+        if changed {
+            config.write().await.update()?;
         }
     }
 }
