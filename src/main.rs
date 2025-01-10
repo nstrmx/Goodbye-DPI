@@ -8,6 +8,8 @@ mod client;
 use client::*;
 mod config;
 use config::*;
+mod dns;
+use dns::*;
 
 
 #[derive(Parser)]

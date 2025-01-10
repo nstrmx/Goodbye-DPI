@@ -11,9 +11,6 @@ use url::Url;
 use crate::SharedConfig;
 
 
-const BUFFER_SIZE: usize = 4096;
-
-
 pub struct Client {
     id: usize,
     local_stream: TcpStream,
@@ -31,7 +28,9 @@ impl Client {
 
     pub async fn handle(&mut self) -> Result<()> {
         // Read stream
-        let mut buffer = vec![0; BUFFER_SIZE];
+        let buffer_size = {self.config.read().await.buffer_size};
+        debug!("Client {}: buffer size {buffer_size}", self.id);
+        let mut buffer = vec![0; buffer_size];
         let n = self.local_stream.read(&mut buffer).await?;
         buffer.truncate(n);
         if n == 0 {
@@ -68,8 +67,9 @@ impl Client {
         match parsed_url.scheme() {
             "http" => {
                 let port = parsed_url.port().unwrap_or(80);
-                let addr = format!("{}:{}", host, port);
-                let mut tcp_stream = TcpStream::connect(addr).await?;
+                let ip_addr = { self.config.read().await.dns.lookup_ip(&host).await? };
+                let target_addr = format!("{}:{}", ip_addr, port);
+                let mut tcp_stream = TcpStream::connect(target_addr).await?;
                 tcp_stream.write_all(buffer).await?;
                 tcp_stream.flush().await?;
                 self.local_stream.pipe_stream(&mut tcp_stream).await?
@@ -88,6 +88,9 @@ impl Client {
         let port_part = target_parts[1];
         let host = String::from_utf8_lossy(host_part).to_string();
         let port: u16 = String::from_utf8_lossy(port_part).parse()?;    
+        let ip_addr = { self.config.read().await.dns.lookup_ip(&host).await? };
+        let target_addr = format!("{ip_addr}:{port}");
+        debug!("Client {}: target addr {target_addr}", self.id);
         // Connect to remote stream
         let server_count = {self.config.read().await.servers.len()};
         for i in 0..server_count {
@@ -107,7 +110,6 @@ impl Client {
                 server_url.host().context(format!("Unsupported url {}", server_url))?,
                 server_url.port().context(format!("Unsupported url {}", server_url))?
             ).parse()?;
-            let target_addr = format!("{host}:{port}");
             match server_url.scheme() {
                 "socks5" => {
                     let mut stream = Socks5Stream::connect(proxy_addr, target_addr).await?;
@@ -127,7 +129,7 @@ impl Client {
             }
             return Ok(());
         }
-        let mut tcp_stream = TcpStream::connect((host.clone(), port)).await?;
+        let mut tcp_stream = TcpStream::connect(target_addr).await?;
         debug!("Client {}: connected to remote stream {host}:{port}", self.id);
         // Respond OK
         self.local_stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
@@ -142,7 +144,8 @@ impl Client {
 
     
     async fn fragment_stream(&mut self, remote_stream: &mut TcpStream) -> Result<()> {
-        let mut buffer = vec![0; BUFFER_SIZE];
+        let buffer_size = {self.config.read().await.buffer_size};
+        let mut buffer = vec![0; buffer_size];
         let n = self.local_stream.read(&mut buffer).await?;
         buffer.truncate(n);
         debug!("Client {}: fragment read {n} bytes", self.id);
