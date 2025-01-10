@@ -7,6 +7,7 @@ The idea is to fragment first data packet on TCP level using blacklist and Aho-C
 - [Installation](#installation)
 - [Usage](#usage)
 - [Blacklists](#blacklists)
+- [DNS](#dns)
 - [Contributing](#contributing)
 
 ## Installation
@@ -17,6 +18,11 @@ Make sure you have the following installed on your system:
 
 - [Rust](https://www.rust-lang.org/tools/install)
 - [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) (comes with Rust)
+
+
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
 
 #### Clone the Repository
 First, clone the repository to your local machine:
@@ -58,6 +64,10 @@ Imagine you are trying to access Twitter, which works perfectly with your defaul
 Your configuration might look something like this:
 ```yaml
 # Your default proxy (Goodbye-DPI)
+buffer_size: 4096
+dns:
+  server: cloudflare
+  over: https
 default: 
   url: "tcp//127.0.0.1:8080"
   blacklist: "default_blacklist"
@@ -74,6 +84,49 @@ servers:
 cargo run --release -- --config your_config.yaml
 ```
 With this configuration, any requests to twimg.com will be routed through the Tor proxy, while all other traffic will continue to be processed by the default proxy at 127.0.0.1:8080. This allows you to bypass restrictions on specific hosts without affecting your overall browsing experience.
+
+Note: config reloads automaticaly.
+
+## DNS
+This proxy server supports configurable DNS resolution, allowing you to choose between multiple popular DNS providers. Each provider can be configured to use specific protocols, including TLS, HTTPS, TCP, or UDP.
+
+#### Supported DNS Providers
+* Google Public DNS
+* Cloudflare DNS
+* Quad9 DNS
+
+Each provider offers robust and secure DNS services, and the protocol you choose determines how the DNS queries are sent to the provider.
+
+#### Available Protocols
+* TLS: Secure and encrypted DNS resolution over TLS.
+* HTTPS: DNS resolution using the DoH (DNS-over-HTTPS) protocol.
+* TCP/UDP: Standard DNS resolution using TCP or UDP. These share the same configuration and are considered the "default" behavior.
+
+#### Configuration
+You can configure the DNS provider and protocol in your application settings or configuration file. Below is an example of how to configure the DNS feature:
+
+Example Configuration
+```yaml
+buffer_size: 4096
+dns:
+  server: cloudflare
+  over: https
+default: 
+  url: "tcp//127.0.0.1:8080"
+  blacklist: "default_blacklist"
+````
+provider: Specifies the DNS service to use (cloudflare, google, or quad9).
+protocol: Defines the protocol to be used for DNS queries (tls, https, or default).
+
+#### Default Protocol Behavior
+If the provider is set to default, the server will use google server for DNS resolution.
+If the protocol is set to default, the server will use either TCP or UDP for DNS resolution, depending on the network and query type.
+
+#### Benefits of Configurable DNS
+Flexibility: Easily switch between DNS providers based on your preferences or requirements.
+Security: Use TLS or HTTPS for encrypted DNS queries, ensuring privacy and protection against DNS spoofing.
+Performance: Choose a protocol that suits your network environment for optimal performance.
+By leveraging this feature, you can ensure efficient and secure DNS resolution for your proxy server while maintaining flexibility in your configurations.
 
 ## Contributing
 If you would like to contribute to this project, please follow these steps:
